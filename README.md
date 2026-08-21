@@ -129,3 +129,36 @@ gh workflow run build.yml -f app_ref=v1.6.0 -f image_tag=1.6.0
 - **ipvlan L2.** Verify from a separate LAN host, not from the Docker host itself.
 - **`shm_size: 2gb`.** The base image defaults to 64M and Chromium renderers crash on it.
 - **`seccomp=unconfined`.** Chromium's sandbox needs syscalls the default profile blocks.
+
+## Migrating from a Brave container
+
+Brave profiles are plain Chromium user-data-dirs, so they transfer directly. If both
+trees sit on the same btrfs pool, `deploy/migrate-brave.sh` copies them with
+`--reflink=always`: 18G of profiles migrate in seconds and cost no extra disk, and the
+originals stay untouched as a rollback path.
+
+```bash
+./migrate-brave.sh --dry-run                                  # inventory first
+./migrate-brave.sh --core-id <id> --preserve-ua               # copy + register
+./migrate-brave.sh --core-id <id> --only wlxbpc1              # one profile
+```
+
+Cookies survive because Linux Chromium encrypts them with a key derived from a
+hardcoded passphrase (the `v10` tag) whenever no keyring is present — as in these
+images. `v11` cookies would be bound to a keyring and would *not* survive.
+Verify decryption in the running browser, not just on disk:
+
+```bash
+python3 deploy/verify-cookies.py <debug-port> <browser-ws-path>   # VERDICT=DECRYPT_OK
+```
+
+`--preserve-ua` keeps the spoofed user agent the profile's cookies were issued under
+and skips Ant Browser's own fingerprint args. Without it the cookies still load but
+UA, canvas and platform all change at once, which can trigger re-verification.
+
+Not migrated: Brave-specific prefs (Shields, Wallet, Rewards) and proxy settings —
+Brave took a `--proxy-server` flag, Ant Browser manages proxies itself.
+
+Note that launching a migrated profile mutates it (Chromium expires stale cookies and
+rewrites `Last Version`), so the copy stops being byte-identical to the original after
+first run. That is expected; the originals are never written to.
