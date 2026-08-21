@@ -15,11 +15,18 @@ LABEL org.opencontainers.image.licenses="NOASSERTION"
 # socat backs the Launch API relay, dbus-x11 gives the app a session bus.
 # curl, iproute2 (ss) and x11-utils (xdpyinfo) are absent from the base image and
 # are all used by antctl.
+#
+# libnss3 is for the *browser core*, not the Wails app: Chromium links
+# libnss3/libnssutil3/libsmime3 (and libnspr4/libplc4/libplds4 via libnspr4) for
+# certificate and crypto handling, and none of them are in the base image or in
+# webkit2gtk's dependency closure. Without it a core exits immediately at launch
+# with a bare loader error, which surfaces only as "the instance won't start".
 RUN apt-get update \
  && apt-get -y install --no-install-recommends \
       libwebkit2gtk-4.1-0 \
       libgtk-3-0 \
       libayatana-appindicator3-1 \
+      libnss3 \
       fonts-noto-cjk \
       fonts-noto-color-emoji \
       socat \

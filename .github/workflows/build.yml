@@ -192,6 +192,20 @@ jobs:
                command -v "$b" > /dev/null || { echo "missing: $b"; exit 1; }
              done'
           echo "Required runtime tools present."
+          # Browser cores are supplied at runtime, so CI cannot ldd a real core.
+          # Assert the libraries Chromium needs are resolvable instead — a missing
+          # NSS stack only shows up as "instances won't start" on the target host.
+          docker run --rm --entrypoint bash "$image" -c '
+            missing=""
+            for lib in libnss3.so libnssutil3.so libsmime3.so libnspr4.so \
+                       libgbm.so.1 libasound.so.2 libatk-1.0.so.0 libatspi.so.0 \
+                       libcups.so.2 libdrm.so.2 libxkbcommon.so.0 libXcomposite.so.1 \
+                       libXdamage.so.1 libXrandr.so.2 libXtst.so.6 libpango-1.0.so.0; do
+              ldconfig -p | grep -q "$lib" || missing="$missing $lib"
+            done
+            if [ -n "$missing" ]; then echo "missing core libs:$missing"; exit 1; fi
+            echo "Chromium core libraries resolvable."
+          '
           docker run --rm --entrypoint bash "$image" -c \
             'bash -n /opt/scripts/start.sh && bash -n /opt/scripts/start-server.sh && bash -n /opt/scripts/antctl'
           echo "Container scripts parse cleanly."
