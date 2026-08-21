@@ -1,0 +1,17 @@
+background: unset
+toolbar.background: flat
+toolbar.background.color: #333333
+toolbar.background.colorTo: #555555
+toolbar.alpha: 255
+toolbar.borderWidth: 1
+toolbar.borderColor: #222222
+toolbar*font: sans-10
+toolbar.clock*font: sans-10
+toolbar.clock*textColor: #FFFFFF
+toolbar.iconbar.focused.color: #4a90d9
+toolbar.iconbar.unfocused.color: #666666
+toolbar.iconbar.focused.textColor: #FFFFFF
+toolbar.iconbar.unfocused.textColor: #CCCCCC
+toolbar.workspace*font: sans-10
+toolbar.workspace*textColor: #FFFFFF
+toolbar.window.tab*font: sans-9

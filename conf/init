@@ -1,0 +1,19 @@
+! Fluxbox settings for the Ant Browser container.
+! Only the app window is ever shown, so the toolbar mainly exists to give you a
+! clock and a way back to a window that got minimized.
+
+session.styleFile: /usr/share/fluxbox/styles//Squared_for_Debian
+session.configVersion:	13
+
+session.screen0.toolbar.visible: true
+session.screen0.toolbar.alpha: 255
+session.screen0.toolbar.height: 24
+session.screen0.toolbar.placement: BottomCenter
+session.screen0.toolbar.widthPercent: 100
+session.screen0.toolbar.overlay: false
+session.screen0.toolbar.autoHide: false
+session.screen0.toolbar.tools: clock, systemtray, workspacename, prevworkspace, nextworkspace, iconbar, windowtabs
+session.screen0.toolbar.wheelMode: Workspace
+session.screen0.toolbar.toolbarDelayClose: 700
+session.screen0.toolbar.toolbarDelayHide: 500
+session.screen0.toolbar.timestampFormat: %H:%M:%S
