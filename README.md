@@ -1,0 +1,131 @@
+# docker-antbrowser
+
+Run [Ant Browser](https://github.com/black-ant/Ant-Browser) in a container and use it
+from a browser over noVNC. Built after [noir017/docker-brave](https://github.com/noir017/docker-brave).
+
+Ant Browser is a Wails desktop app (GTK3 + WebKit2GTK), not a web service — it needs a
+real X display. This image puts it on a TurboVNC display served through noVNC, using
+[`ich777/novnc-baseimage`](https://github.com/ich777/docker-novnc-baseimage) as the base.
+
+- Image: `ghcr.io/noir017/ant-browser:latest` (public, `linux/amd64`)
+- Built by GitHub Actions from source — the app is never compiled on the target host
+
+## Quick start
+
+```bash
+mkdir -p /mnt/cache/appdata/antbrowser/data
+cd /mnt/cache/appdata/antbrowser
+curl -fsSLO https://raw.githubusercontent.com/noir017/docker-antbrowser/master/deploy/docker-compose.yml
+curl -fsSL  https://raw.githubusercontent.com/noir017/docker-antbrowser/master/deploy/.env.example -o .env
+$EDITOR .env          # at minimum, set ANT_IP to a free address on your LAN
+docker compose up -d
+```
+
+Then open `http://<ANT_IP>:8080` **from another machine on the LAN** — an ipvlan
+container is not reachable from its own host by L2 design unless a shim interface
+is configured.
+
+## Layout
+
+```
+image (read-only)   /opt/ant-browser/{ant-chrome, config.yaml, bin/xray, bin/sing-box, chrome/}
+host (writable)     ./data  ->  /user/.local/share/ant-browser
+                                 ├── config.yaml        seeded on first run
+                                 ├── data/app.db        instances, proxies, scripts
+                                 ├── data/<profile>/    per-instance browser profiles
+                                 ├── chrome/            browser cores (you supply these)
+                                 └── logs/
+```
+
+Only one directory is mounted. `/opt/ant-browser` stays root-owned and read-only, which
+makes the app relocate its writable state to `$XDG_DATA_HOME/ant-browser` and seed
+`config.yaml` and `chrome/` there on first run — see `backend/internal/apppath/apppath.go`
+in the app repo. `bin/` always resolves against the install root, so `xray` and `sing-box`
+ship with the image and update with it.
+
+Do not bind-mount `config.yaml` on its own: the app rewrites it, and a single-file
+bind mount breaks when the inode is replaced.
+
+## Installing a browser core
+
+The image ships **no Chromium core** — upstream releases only include a placeholder
+README under `chrome/`. Without a core the UI starts fine but instances cannot launch.
+
+```bash
+cd /mnt/cache/appdata/antbrowser/data/chrome
+curl -fsSLO https://github.com/adryfish/fingerprint-chromium/releases/download/148.0.7778.215/ungoogled-chromium-148.0.7778.215-1-x86_64_linux.tar.xz
+tar -xJf ungoogled-chromium-*.tar.xz
+mv ungoogled-chromium-*-x86_64 fp-148
+rm ungoogled-chromium-*.tar.xz
+
+docker exec antbrowser antctl core ls    # confirm the executable is detected
+```
+
+Then in the UI: **内核管理 → 新增**, path `chrome/fp-148`, backend
+`fingerprint-chromium`, mark it default.
+
+For the Cloak backend, register a directory containing `chromium-<version>/` instead, and
+put `CLOAKBROWSER_LICENSE_KEY=...` in the core's environment-variables field.
+
+## `antctl`
+
+Manage the app from the host. Ant Browser handles its own browser instances, so this
+covers the app process and the pieces around it.
+
+```bash
+docker exec antbrowser antctl status
+docker exec antbrowser antctl restart
+docker exec antbrowser antctl logs -f
+docker exec antbrowser antctl api /api/profiles
+docker exec antbrowser antctl core ls
+docker exec antbrowser antctl unlock       # after an unclean shutdown
+```
+
+## Launch API
+
+The app's Launch API listens on `127.0.0.1:19876` and rejects every caller whose
+`RemoteAddr` is not `127.0.0.1`. With `ANT_API_RELAY=1` a socat relay inside the
+container forwards `:19877` to it, which re-originates the connection locally:
+
+```bash
+curl http://192.168.2.201:19877/api/health      # {"ok":true}
+curl http://192.168.2.201:19877/api/profiles
+curl http://192.168.2.201:19877/json/version    # CDP of the active instance
+```
+
+**This intentionally bypasses the app's localhost-only restriction.** Anyone who can
+reach the port can create instances, launch them, and attach a debugger. Set
+`ANT_API_RELAY=0` to turn it off, or enable API-key auth (`launch_server.auth`) in the
+app's settings page before leaving it exposed.
+
+## Environment
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TZ` | `Asia/Shanghai` | Timezone |
+| `CUSTOM_RES_W` / `CUSTOM_RES_H` | `1600` / `900` | Display size; floored at 1280x800 |
+| `CUSTOM_DEPTH` | `24` | Colour depth |
+| `NOVNC_PORT` / `RFB_PORT` | `8080` / `5900` | noVNC / VNC ports |
+| `NOVNC_RESIZE` | `scale` | `off`, `scale`, `remote` |
+| `NOVNC_QUALITY` / `NOVNC_COMPRESSION` | `6` / `2` | noVNC tuning, 0-9 |
+| `ANT_AUTOSTART` | `1` | Start the GUI on boot |
+| `ANT_API_RELAY` | `1` | Expose the Launch API to the LAN |
+| `ANT_API_RELAY_PORT` | `19877` | Relay listen port |
+| `UID` / `GID` / `UMASK` | `99` / `100` / `000` | Unraid `nobody:users` |
+
+## Building
+
+CI checks out the container definition and the app source separately, builds with the
+app's own `publish/linux/publish-linux.sh`, and pushes to GHCR. Run it manually to pick a
+different source ref:
+
+```bash
+gh workflow run build.yml -f app_ref=v1.6.0 -f image_tag=1.6.0
+```
+
+## Notes
+
+- **amd64 only.** Cross-building the Wails/CGO binary for arm64 needs a native runner.
+- **ipvlan L2.** Verify from a separate LAN host, not from the Docker host itself.
+- **`shm_size: 2gb`.** The base image defaults to 64M and Chromium renderers crash on it.
+- **`seccomp=unconfined`.** Chromium's sandbox needs syscalls the default profile blocks.

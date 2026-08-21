@@ -1,0 +1,407 @@
+#!/bin/bash
+# antctl - manage the Ant Browser app inside the container.
+#
+# Ant Browser manages its own browser instances (via its UI and Launch API), so
+# unlike docker-brave's bravectl this script manages the *app process* plus the
+# bits around it: the API, the state dir, and the browser cores you drop in.
+
+set -uo pipefail
+
+APP_DIR="${APP_DIR:-/opt/ant-browser}"
+APP_BIN="${APP_BIN:-$APP_DIR/ant-chrome}"
+ANT_STATE_DIR="${ANT_STATE_DIR:-/user/.local/share/ant-browser}"
+ANT_API_PORT="${ANT_API_PORT:-19876}"
+ANT_API_RELAY_PORT="${ANT_API_RELAY_PORT:-19877}"
+NOVNC_PORT="${NOVNC_PORT:-8080}"
+RFB_PORT="${RFB_PORT:-5900}"
+RUN_USER="${USER:-user}"
+PID_FILE="/tmp/antbrowser.pid"
+LOG_FILE="${ANT_STATE_DIR}/logs/antbrowser.out"
+STOP_TIMEOUT=10
+
+show_usage() {
+    cat <<EOF
+用法: antctl <command> [options]
+
+命令:
+  start              启动 Ant Browser 图形界面
+  stop               停止 Ant Browser（先 SIGTERM，超时再 SIGKILL）
+  restart            重启 Ant Browser
+  status             查看进程、端口、状态目录和内核情况
+  logs [-f]          查看应用日志（-f 跟随输出）
+  api <path> [args]  调用 Launch API，例如 antctl api /api/profiles
+  core ls            列出 ${ANT_STATE_DIR}/chrome 下的内核及探测到的可执行文件
+  unlock [--quiet]   清理单实例锁和实例 Singleton 文件（异常退出后用）
+  help               显示本帮助
+
+示例:
+  antctl status
+  antctl api /api/health
+  antctl api /api/launch/mycode -X POST
+  antctl core ls
+  antctl logs -f
+
+说明:
+  应用安装目录（只读）: ${APP_DIR}
+  可写状态目录        : ${ANT_STATE_DIR}
+  Launch API（容器内） : http://127.0.0.1:${ANT_API_PORT}
+  Launch API（对外中继）: 端口 ${ANT_API_RELAY_PORT}
+  浏览器内核请放到     : ${ANT_STATE_DIR}/chrome/<名称>/
+EOF
+}
+
+# start-server.sh runs this as ${USER}; a `docker exec` lands here as root.
+# The app must never run as root or it writes root-owned files into the bind mount.
+reexec_as_user_if_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        exec su -p "$RUN_USER" -c "$(printf '%q ' /opt/scripts/antctl "$@")"
+    fi
+}
+
+app_pid() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid="$(cat "$PID_FILE" 2>/dev/null)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    # Fall back to a process scan so a lost pidfile doesn't orphan the app.
+    local scanned
+    scanned="$(pgrep -f "^${APP_BIN}" 2>/dev/null | head -n 1)"
+    if [[ -n "$scanned" ]]; then
+        echo "$scanned"
+        return 0
+    fi
+    return 1
+}
+
+is_running() {
+    app_pid > /dev/null 2>&1
+}
+
+port_state() {
+    local port="$1"
+    if ! command -v ss > /dev/null 2>&1; then
+        echo "未知(缺少 ss)"
+        return
+    fi
+    if ss -ltn 2>/dev/null | grep -q ":${port} "; then
+        echo "监听中"
+    else
+        echo "未监听"
+    fi
+}
+
+start_app() {
+    reexec_as_user_if_root start "$@"
+
+    if is_running; then
+        echo "Ant Browser 已在运行 (PID: $(app_pid))"
+        return 0
+    fi
+
+    if [[ ! -x "$APP_BIN" ]]; then
+        echo "错误: 应用不存在或不可执行: $APP_BIN"
+        return 1
+    fi
+
+    export DISPLAY="${DISPLAY:-:99}"
+    export XAUTHORITY="${XAUTHORITY:-${DATA_DIR:-/user}/.Xauthority}"
+
+    if command -v xdpyinfo > /dev/null 2>&1; then
+        if ! xdpyinfo -display "$DISPLAY" > /dev/null 2>&1; then
+            echo "警告: X display $DISPLAY 尚不可用，应用可能起不来窗口"
+        fi
+    fi
+
+    mkdir -p "${ANT_STATE_DIR}/logs"
+
+    echo "正在启动 Ant Browser..."
+    echo "  安装目录: $APP_DIR"
+    echo "  状态目录: $ANT_STATE_DIR"
+    echo "  DISPLAY : $DISPLAY"
+
+    # dbus-run-session gives the app its own session bus; without one GTK logs a
+    # stream of dbus errors and the tray/appindicator integration misbehaves.
+    cd "$APP_DIR" || return 1
+    nohup dbus-run-session -- "$APP_BIN" >> "$LOG_FILE" 2>&1 &
+    local launched=$!
+    echo "$launched" > "$PID_FILE"
+
+    # The app forks/relocates during startup, so confirm rather than assume.
+    sleep 5
+    if ! is_running; then
+        echo "错误: 应用启动失败，日志尾部："
+        tail -n 30 "$LOG_FILE" 2>/dev/null
+        rm -f "$PID_FILE"
+        return 1
+    fi
+
+    echo "✅ Ant Browser 已启动 (PID: $(app_pid))"
+
+    # The Launch API comes up a moment after the window.
+    local waited=0
+    while [[ $waited -lt 20 ]]; do
+        if curl -fsS --max-time 2 "http://127.0.0.1:${ANT_API_PORT}/api/health" > /dev/null 2>&1; then
+            echo "✅ Launch API 就绪: http://127.0.0.1:${ANT_API_PORT}"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "ℹ️  Launch API 暂未响应（端口 ${ANT_API_PORT}），如未在设置中启用可忽略"
+    return 0
+}
+
+stop_app() {
+    reexec_as_user_if_root stop "$@"
+
+    if ! is_running; then
+        echo "Ant Browser 未在运行"
+        rm -f "$PID_FILE"
+        clear_locks quiet
+        return 0
+    fi
+
+    local pid
+    pid="$(app_pid)"
+    echo "正在停止 Ant Browser (PID: $pid)..."
+
+    kill -TERM "$pid" 2>/dev/null || true
+
+    local count=0
+    while [[ $count -lt $STOP_TIMEOUT ]]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "进程未响应 SIGTERM，强制终止..."
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Browser instances the app spawned are children of the app; if it was
+    # SIGKILLed they survive and hold their profile locks.
+    local strays
+    strays="$(pgrep -f -- "--user-data-dir=${ANT_STATE_DIR}" 2>/dev/null || true)"
+    if [[ -n "$strays" ]]; then
+        echo "清理残留的浏览器实例进程..."
+        echo "$strays" | while read -r spid; do
+            [[ -n "$spid" ]] && kill -TERM "$spid" 2>/dev/null || true
+        done
+        sleep 2
+        echo "$strays" | while read -r spid; do
+            [[ -n "$spid" ]] && kill -0 "$spid" 2>/dev/null && kill -KILL "$spid" 2>/dev/null || true
+        done
+    fi
+
+    rm -f "$PID_FILE"
+    clear_locks quiet
+    echo "✅ Ant Browser 已停止"
+}
+
+restart_app() {
+    reexec_as_user_if_root restart "$@"
+    stop_app
+    sleep 2
+    start_app
+}
+
+show_status() {
+    echo "Ant Browser 状态"
+    echo "========================"
+
+    if is_running; then
+        local pid start_time rss
+        pid="$(app_pid)"
+        start_time="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')"
+        rss="$(ps -o rss= -p "$pid" 2>/dev/null | awk '{printf "%.0f MB", $1/1024}')"
+        printf "  %-14s %s\n" "进程" "运行中 (PID: $pid)"
+        printf "  %-14s %s\n" "启动时间" "${start_time:-未知}"
+        printf "  %-14s %s\n" "内存占用" "${rss:-未知}"
+    else
+        printf "  %-14s %s\n" "进程" "已停止"
+    fi
+
+    echo ""
+    echo "端口"
+    printf "  %-14s %-10s (%s)\n" "noVNC"    "$NOVNC_PORT"          "$(port_state "$NOVNC_PORT")"
+    printf "  %-14s %-10s (%s)\n" "VNC"      "$RFB_PORT"            "$(port_state "$RFB_PORT")"
+    printf "  %-14s %-10s (%s)\n" "API 内部" "$ANT_API_PORT"        "$(port_state "$ANT_API_PORT")"
+    printf "  %-14s %-10s (%s)\n" "API 中继" "$ANT_API_RELAY_PORT"  "$(port_state "$ANT_API_RELAY_PORT")"
+
+    echo ""
+    echo "Launch API"
+    local health
+    health="$(curl -fsS --max-time 3 "http://127.0.0.1:${ANT_API_PORT}/api/health" 2>/dev/null)"
+    if [[ -n "$health" ]]; then
+        printf "  %-14s %s\n" "健康检查" "$health"
+    else
+        printf "  %-14s %s\n" "健康检查" "无响应"
+    fi
+
+    echo ""
+    echo "目录"
+    printf "  %-14s %s\n" "安装(只读)" "$APP_DIR"
+    printf "  %-14s %s\n" "状态(可写)" "$ANT_STATE_DIR"
+    if [[ -f "${ANT_STATE_DIR}/config.yaml" ]]; then
+        printf "  %-14s %s\n" "config.yaml" "已生成"
+    else
+        printf "  %-14s %s\n" "config.yaml" "缺失（应用首次启动后自动生成）"
+    fi
+    if [[ -f "${ANT_STATE_DIR}/data/app.db" ]]; then
+        printf "  %-14s %s\n" "数据库" "$(du -h "${ANT_STATE_DIR}/data/app.db" 2>/dev/null | cut -f1)"
+    else
+        printf "  %-14s %s\n" "数据库" "尚未创建"
+    fi
+
+    echo ""
+    list_cores
+}
+
+list_cores() {
+    local core_root="${ANT_STATE_DIR}/chrome"
+    echo "浏览器内核 ($core_root)"
+
+    if [[ ! -d "$core_root" ]]; then
+        echo "  目录不存在"
+        return 0
+    fi
+
+    local found=0
+    while IFS= read -r dir; do
+        [[ -z "$dir" ]] && continue
+        local name exe
+        name="$(basename "$dir")"
+        # Candidate names mirror CoreExecutableCandidates() for linux in the app:
+        # backend/internal/browser/core_binary.go
+        exe="$(find "$dir" -maxdepth 6 -type f \
+                 \( -name chrome -o -name chrome-bin -o -name chromium \
+                    -o -name chromium-browser -o -name ungoogled-chromium \) \
+                 2>/dev/null | head -n 1)"
+        if [[ -n "$exe" ]]; then
+            printf "  %-24s %s\n" "$name" "${exe#$core_root/}"
+        else
+            printf "  %-24s %s\n" "$name" "⚠️  未找到可执行文件"
+        fi
+        found=$((found + 1))
+    done < <(find "$core_root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+
+    if [[ $found -eq 0 ]]; then
+        echo "  未安装内核 —— 实例将无法启动"
+        echo "  把内核解压到 $core_root/<名称>/ 后，在界面「内核管理」里注册"
+    fi
+}
+
+show_logs() {
+    mkdir -p "${ANT_STATE_DIR}/logs"
+    local app_log="${ANT_STATE_DIR}/logs/app.log"
+    local target="$LOG_FILE"
+
+    # file_enabled defaults to false in config, so app.log may never appear;
+    # stdout/stderr captured by antctl start is the reliable source.
+    if [[ -f "$app_log" ]]; then
+        echo "--- $app_log ---"
+        target="$app_log"
+    else
+        echo "--- $LOG_FILE (应用 stdout/stderr) ---"
+    fi
+
+    if [[ ! -f "$target" ]]; then
+        echo "日志文件还不存在"
+        return 0
+    fi
+
+    if [[ "${1:-}" == "-f" ]]; then
+        tail -f "$target"
+    else
+        tail -n 200 "$target"
+    fi
+}
+
+call_api() {
+    local path="${1:-/api/health}"
+    shift || true
+    if [[ "$path" != /* ]]; then
+        path="/$path"
+    fi
+    curl -sS -w '\n' "$@" "http://127.0.0.1:${ANT_API_PORT}${path}"
+}
+
+clear_locks() {
+    local quiet="${1:-}"
+    local lock="${ANT_STATE_DIR}/app-instance.lock"
+
+    [[ "$quiet" != "quiet" ]] && echo "正在清理锁文件..."
+
+    if is_running && [[ "$quiet" != "quiet" ]]; then
+        echo "警告: Ant Browser 正在运行，建议先 antctl stop"
+        return 1
+    fi
+
+    rm -f "$lock" 2>/dev/null || true
+    [[ "$quiet" != "quiet" ]] && echo "  已清理: $lock"
+
+    # Instance profiles keep Chromium singleton files; a hard kill leaves them behind
+    # and the next launch of that profile fails.
+    local cleaned=0
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        rm -f "$f" 2>/dev/null && cleaned=$((cleaned + 1))
+    done < <(find "${ANT_STATE_DIR}/data" -maxdepth 4 \
+               \( -name 'SingletonLock' -o -name 'SingletonCookie' -o -name 'SingletonSocket' \) \
+               2>/dev/null)
+
+    if [[ "$quiet" != "quiet" ]]; then
+        echo "  已清理 $cleaned 个实例 Singleton 文件"
+        echo "✅ 完成"
+    fi
+    return 0
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        show_usage
+        exit 1
+    fi
+
+    local command="$1"
+    shift || true
+
+    case "$command" in
+        start)   start_app "$@" ;;
+        stop)    stop_app "$@" ;;
+        restart) restart_app "$@" ;;
+        status)  show_status ;;
+        logs)    show_logs "${1:-}" ;;
+        api)     call_api "$@" ;;
+        core)
+            case "${1:-ls}" in
+                ls|list) list_cores ;;
+                *) echo "错误: 未知的 core 子命令 '${1}'（可用: ls）"; exit 1 ;;
+            esac
+            ;;
+        unlock)
+            if [[ "${1:-}" == "--quiet" ]]; then
+                clear_locks quiet
+            else
+                clear_locks
+            fi
+            ;;
+        -h|--help|help) show_usage ;;
+        *)
+            echo "错误: 未知命令 '$command'"
+            echo ""
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

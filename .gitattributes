@@ -1,0 +1,10 @@
+# Force LF on all shell scripts and container-side files.
+# A CRLF entrypoint dies with "bash\r: no such file or directory".
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+Dockerfile  text eol=lf
+scripts/*   text eol=lf
+conf/*      text eol=lf
+*.png       binary
+*.ico       binary

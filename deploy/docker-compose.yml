@@ -1,0 +1,54 @@
+name: antbrowser
+
+services:
+  antbrowser:
+    image: ghcr.io/noir017/ant-browser:latest
+    container_name: antbrowser
+    restart: unless-stopped
+
+    # Chromium instances need far more than the base image's 64M default;
+    # renderers crash with SIGBUS when /dev/shm runs out.
+    shm_size: "2gb"
+
+    # Chromium's sandbox needs syscalls Docker's default seccomp profile blocks.
+    security_opt:
+      - seccomp=unconfined
+
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CUSTOM_RES_W: ${CUSTOM_RES_W:-1600}
+      CUSTOM_RES_H: ${CUSTOM_RES_H:-900}
+      CUSTOM_DEPTH: ${CUSTOM_DEPTH:-24}
+      NOVNC_PORT: ${NOVNC_PORT:-8080}
+      RFB_PORT: ${RFB_PORT:-5900}
+      NOVNC_RESIZE: ${NOVNC_RESIZE:-scale}
+      NOVNC_QUALITY: ${NOVNC_QUALITY:-6}
+      NOVNC_COMPRESSION: ${NOVNC_COMPRESSION:-2}
+      ANT_AUTOSTART: ${ANT_AUTOSTART:-1}
+      ANT_API_RELAY: ${ANT_API_RELAY:-1}
+      ANT_API_RELAY_PORT: ${ANT_API_RELAY_PORT:-19877}
+      UID: ${PUID:-99}
+      GID: ${PGID:-100}
+      UMASK: ${UMASK:-000}
+
+    volumes:
+      # Single writable mount. /opt/ant-browser inside the image is read-only, so
+      # the app relocates all state here and seeds config.yaml + chrome/ on first
+      # run. Do NOT bind-mount config.yaml separately — the app rewrites it.
+      - /mnt/cache/appdata/antbrowser/data:/user/.local/share/ant-browser
+
+    networks:
+      lan:
+        ipv4_address: ${ANT_IP:-192.168.2.201}
+
+    labels:
+      net.unraid.docker.managed: "composeman"
+      net.unraid.docker.webui: "http://[IP]:[PORT:8080]"
+      net.unraid.docker.shell: "bash"
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/black-ant/Ant-Browser/master/build/appicon.png"
+
+networks:
+  lan:
+    # Reuse the host's existing ipvlan network; never let compose recreate it.
+    external: true
+    name: bond4

@@ -1,0 +1,214 @@
+name: Build and Push Image
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "README.md"
+      - "deploy/**"
+  workflow_dispatch:
+    inputs:
+      app_repo:
+        description: Ant Browser source repository
+        required: false
+        default: noir017/Ant-Browser
+        type: string
+      app_ref:
+        description: Branch, tag or SHA of the source repository
+        required: false
+        default: master
+        type: string
+      image_tag:
+        description: Extra image tag to publish, for example 1.6.0
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ant-browser
+  APP_REPO: ${{ inputs.app_repo || 'noir017/Ant-Browser' }}
+  APP_REF: ${{ inputs.app_ref || 'master' }}
+
+jobs:
+  build:
+    name: Build app and publish image
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout container definition
+        uses: actions/checkout@v4
+
+      - name: Checkout Ant Browser source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.APP_REF }}
+          path: src
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/frontend/package-lock.json
+
+      # Mirrors the app's own .github/workflows/publish-linux.yml so the build
+      # environment matches what upstream releases are produced with.
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            dpkg-dev \
+            git \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            pkg-config \
+            python3 \
+            tar
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Add Go bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Reuse the project's own publish script: it handles the webkit 4.0/4.1
+      # pkg-config probe (adding the webkit2_41 build tag), verifies the pinned
+      # xray/sing-box hashes, and assembles the tarball layout the image expects.
+      - name: Build Linux package
+        working-directory: src
+        env:
+          BROWSERSLIST_IGNORE_OLD_DATA: "1"
+        run: bash publish/linux/publish-linux.sh --arch amd64
+
+      - name: Stage tarball for image build
+        id: stage
+        run: |
+          set -euo pipefail
+          tar_file="$(ls -1 src/publish/output/AntBrowser-*-linux-amd64.tar.gz | head -n 1)"
+          echo "Staging: $tar_file"
+
+          # Fail early rather than shipping an image whose app cannot start.
+          validate_dir="$(mktemp -d)"
+          tar -xzf "$tar_file" -C "$validate_dir"
+          test -x "$validate_dir/ant-chrome"
+          test -x "$validate_dir/bin/xray"
+          test -x "$validate_dir/bin/sing-box"
+          test -f "$validate_dir/config.yaml"
+
+          mkdir -p dist
+          cp "$tar_file" dist/AntBrowser-linux-amd64.tar.gz
+
+          version="$(basename "$tar_file" | sed -E 's/^AntBrowser-(.+)-linux-amd64\.tar\.gz$/\1/')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "app_sha=$(git -C src rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Built version $version"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compose image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          repo="${REGISTRY}/${IMAGE_NAME}"
+          repo="$(echo "$repo" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "tags<<EOF"
+            echo "${repo}:latest"
+            echo "${repo}:${{ steps.stage.outputs.version }}"
+            echo "${repo}:app-${{ steps.stage.outputs.app_sha }}"
+            if [[ -n "${{ inputs.image_tag }}" ]]; then
+              echo "${repo}:${{ inputs.image_tag }}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Only amd64: the target host is an Intel N100, and cross-building a
+          # Wails/CGO binary for arm64 needs a native runner to be reliable.
+          platforms: linux/amd64
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.stage.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            net.antbrowser.app.repo=${{ env.APP_REPO }}
+            net.antbrowser.app.ref=${{ env.APP_REF }}
+            net.antbrowser.app.revision=${{ steps.stage.outputs.app_sha }}
+
+      # A missing shared library only shows up as "the GUI never appears", so
+      # assert the link closure now, on the image we just pushed.
+      - name: Verify image dependency closure
+        run: |
+          set -euo pipefail
+          repo="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          image="${repo}:${{ steps.stage.outputs.version }}"
+          docker pull "$image"
+          missing="$(docker run --rm --entrypoint bash "$image" -c \
+            'ldd /opt/ant-browser/ant-chrome | grep "not found" || true')"
+          if [[ -n "$missing" ]]; then
+            echo "::error::unresolved shared libraries in image:"
+            echo "$missing"
+            exit 1
+          fi
+          echo "All shared libraries resolved."
+          docker run --rm --entrypoint bash "$image" -c \
+            'for b in socat vncserver websockify fluxbox dbus-run-session curl ss xdpyinfo jq; do
+               command -v "$b" > /dev/null || { echo "missing: $b"; exit 1; }
+             done'
+          echo "Required runtime tools present."
+          docker run --rm --entrypoint bash "$image" -c \
+            'bash -n /opt/scripts/start.sh && bash -n /opt/scripts/start-server.sh && bash -n /opt/scripts/antctl'
+          echo "Container scripts parse cleanly."
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| app version | \`${{ steps.stage.outputs.version }}\` |"
+            echo "| app repo | \`${{ env.APP_REPO }}\` |"
+            echo "| app ref | \`${{ env.APP_REF }}\` |"
+            echo "| app commit | \`${{ steps.stage.outputs.app_sha }}\` |"
+            echo ""
+            echo '```'
+            echo "${{ steps.tags.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
