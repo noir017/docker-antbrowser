@@ -162,3 +162,64 @@ Brave took a `--proxy-server` flag, Ant Browser manages proxies itself.
 Note that launching a migrated profile mutates it (Chromium expires stale cookies and
 rewrites `Last Version`), so the copy stops being byte-identical to the original after
 first run. That is expected; the originals are never written to.
+
+### Migrating extensions
+
+Extensions are **not** carried by the profile copy alone. A profile stores an
+extension's *data* (userscripts, settings) but not its *code*, and it keys that data
+to the extension ID.
+
+For an unpacked extension (`--load-extension`, `location: 4` in `Preferences`), the
+manifest usually has no `key` field, so Chromium derives the ID from the install path:
+
+```
+extension_id = sha256(absolute_install_path)[:32], mapped 0-9a-f -> a-p
+```
+
+So the path is load-bearing. Loading the same code from a different directory produces
+a different ID, and the migrated profile data — keyed to the old ID — is invisible.
+Verified on this deployment:
+
+| Install path | Resulting ID |
+|---|---|
+| `/opt/scripts/tampermonkey_stable` (Brave) | `flnphpojdiemllbjcohodppdogbampon` |
+| `…/data/extensions/flnphpojdiemllbjcohodppdogbampon` | `djecknifepohipedmifabgkaphndcjgo` |
+
+Mount the code at the path the source browser used, then register it:
+
+```bash
+# 1. stage the unpacked extension on the host
+cp -a /mnt/cache/appdata/braveScripts/tampermonkey_stable \
+      /mnt/cache/appdata/antbrowser/extensions/
+chown -R 99:100 /mnt/cache/appdata/antbrowser/extensions
+
+# 2. bind-mount it at the ORIGINAL container path (see docker-compose.yml)
+#    - .../extensions/tampermonkey_stable:/opt/scripts/tampermonkey_stable:ro
+
+# 3. register it, with install_dir set to the container path
+docker exec antbrowser antctl stop
+sqlite3 .../data/data/app.db "INSERT INTO browser_extensions
+  (extension_id,name,version,manifest_json,install_dir,enabled,installed_at,updated_at)
+  VALUES ('<id>','Tampermonkey','5.2.3','{}','/opt/scripts/tampermonkey_stable',1,
+          datetime('now'),datetime('now'));"
+```
+
+Then bind it per profile — `browser_profile_extensions` (`profile_id`, `extension_id`)
+plus a `browser_profile_extension_settings` row with `configured=1`. The app turns those
+into `--load-extension` / `--disable-extensions-except` at launch
+(`backend/app_instance_start_prepare.go`).
+
+Confirm from inside the browser, not from the filesystem — the extension must be able to
+*read* its storage:
+
+```bash
+curl -s http://127.0.0.1:<debug-port>/json | jq -r '.[]|select(.type=="service_worker")|.url'
+# chrome-extension://<id>/background.js  <- must be the ORIGINAL id
+```
+
+An ID mismatch shows up as a working-but-empty extension: `chrome-extension://<old-id>/…`
+fails with `ERR_BLOCKED_BY_CLIENT` while the dashboard offers only `<New userscript>`.
+
+Extensions installed from the Web Store (`location: 1`) behave differently — their code
+lives in `Default/Extensions/<id>/` inside the profile and their ID comes from the store
+signing key, so those *do* travel with a profile copy.

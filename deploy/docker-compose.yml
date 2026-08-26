@@ -36,6 +36,13 @@ services:
       # the app relocates all state here and seeds config.yaml + chrome/ on first
       # run. Do NOT bind-mount config.yaml separately — the app rewrites it.
       - /mnt/cache/appdata/antbrowser/data:/user/.local/share/ant-browser
+      # Unpacked extensions carried over from another browser. The container path
+      # must match the path the SOURCE browser loaded them from: with no "key" in
+      # manifest.json, Chromium derives the extension ID from SHA256 of the
+      # install path, and a profile keys its extension storage to that ID. Mount
+      # it elsewhere and you get a new ID with an empty profile. Uncomment and
+      # adjust to match your source; see README "Migrating extensions".
+      # - /mnt/cache/appdata/antbrowser/extensions/tampermonkey_stable:/opt/scripts/tampermonkey_stable:ro
 
     networks:
       lan:
