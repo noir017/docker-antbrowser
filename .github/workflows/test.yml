@@ -1,0 +1,117 @@
+name: Test Upstream
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/test.yml"
+  workflow_dispatch:
+    inputs:
+      app_repo:
+        description: Ant Browser source repository
+        required: false
+        default: noir017/Ant-Browser
+        type: string
+      app_ref:
+        description: Branch, tag or SHA of the source repository
+        required: false
+        default: master
+        type: string
+  schedule:
+    # 22:00 UTC = 06:00 CST (UTC+8) next day, running daily upstream tests
+    - cron: "0 22 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-upstream
+  cancel-in-progress: true
+
+env:
+  APP_REPO: ${{ inputs.app_repo || 'noir017/Ant-Browser' }}
+  APP_REF: ${{ inputs.app_ref || 'master' }}
+
+jobs:
+  test:
+    name: Test upstream Ant Browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Ant Browser source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.APP_REF }}
+          path: src
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src/frontend/package-lock.json
+
+      # Linux compilation of Wails v2 requires CGO and system GUI development headers
+      # (GTK3, WebKit2GTK, Ayatana AppIndicator) to compile and link.
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            pkg-config
+
+      # Wails embeds frontend assets into the Go binary via `//go:embed all:frontend/dist`
+      # in main.go. The frontend dist folder must be built before Go compilation/testing
+      # can succeed. Running `npm run build` also triggers `tsc` for TypeScript type checking.
+      - name: Build frontend and type check
+        working-directory: src/frontend
+        run: |
+          npm ci
+          npm run build
+
+      # Verify that all Go packages and the Wails entrypoint compile cleanly.
+      - name: Go build
+        working-directory: src
+        run: go build ./...
+
+      # Run static analysis to catch common Go bugs and suspicious constructs.
+      - name: Go vet
+        working-directory: src
+        run: go vet ./...
+
+      # Run all unit and integration tests with verbose output and caching disabled (-count=1).
+      - name: Go test
+        working-directory: src
+        run: go test ./... -count=1 -v
+
+      - name: Summary
+        if: always()
+        run: |
+          commit_sha="$(git -C src rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+          {
+            echo "### Upstream Test Results"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| App Repo | \`${{ env.APP_REPO }}\` |"
+            echo "| App Ref | \`${{ env.APP_REF }}\` |"
+            echo "| App Commit | \`${commit_sha}\` |"
+            echo "| Status | ${{ job.status == 'success' && '✅ All tests passed successfully' || '❌ Test suite failed' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
