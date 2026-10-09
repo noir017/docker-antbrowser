@@ -201,9 +201,15 @@ jobs:
           fi
           echo "All shared libraries resolved."
           docker run --rm --entrypoint bash "$IMAGE" -c \
-            'for b in socat vncserver websockify fluxbox dbus-run-session curl ss xdpyinfo jq; do
+            'for b in socat websockify fluxbox dbus-run-session curl ss xdpyinfo jq; do
                command -v "$b" > /dev/null || { echo "missing: $b"; exit 1; }
-             done'
+             done
+             # TurboVNC on amd64, TigerVNC on arm64 (see Dockerfile and start-server.sh).
+             if command -v Xtigervnc > /dev/null; then
+               ldd "$(command -v Xtigervnc)" | grep "not found" && exit 1 || true
+             else
+               command -v vncserver > /dev/null || { echo "missing: vncserver"; exit 1; }
+             fi'
           echo "Required runtime tools present."
           # Browser cores are supplied at runtime, so CI cannot ldd a real core.
           # Assert the libraries Chromium needs are resolvable instead — a missing

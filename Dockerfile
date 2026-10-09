@@ -43,6 +43,15 @@ RUN apt-get update \
       psmisc \
  && rm -rf /var/lib/apt/lists/*
 
+# ich777's arm64 base has no TurboVNC, and the x11vnc it ships links
+# libssl.so.1.1, which bookworm does not have. Debian's TigerVNC provides the
+# same single-process X server + VNC design; start-server.sh picks whichever exists.
+RUN if ! command -v vncserver > /dev/null; then \
+      apt-get update \
+      && apt-get -y install --no-install-recommends tigervnc-standalone-server \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Timezone + locales. zh_CN is generated so the app's Chinese UI renders with the
 # Noto CJK fonts installed above instead of tofu boxes.
 RUN ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \

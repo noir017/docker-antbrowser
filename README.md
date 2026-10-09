@@ -126,6 +126,7 @@ gh workflow run build.yml -f app_ref=v1.6.0 -f image_tag=1.6.0
 ## Notes
 
 - **amd64 + arm64.** Each architecture builds on a native runner (`ubuntu-24.04-arm` for arm64); cross-building the Wails/CGO binary is unreliable. The app tarball/.deb of every build is attached to the workflow run as an artifact. Images built before 2026-10-09 are amd64 only.
+- **VNC server differs by arch.** amd64 uses the base image's TurboVNC. ich777's arm64 base has no TurboVNC and its x11vnc is broken (links `libssl.so.1.1`), so arm64 installs Debian's TigerVNC and runs `Xtigervnc` directly.
 - **ipvlan L2.** Verify from a separate LAN host, not from the Docker host itself.
 - **`shm_size: 2gb`.** The base image defaults to 64M and Chromium renderers crash on it.
 - **`seccomp=unconfined`.** Chromium's sandbox needs syscalls the default profile blocks.
