@@ -7,7 +7,7 @@ Ant Browser is a Wails desktop app (GTK3 + WebKit2GTK), not a web service — it
 real X display. This image puts it on a TurboVNC display served through noVNC, using
 [`ich777/novnc-baseimage`](https://github.com/ich777/docker-novnc-baseimage) as the base.
 
-- Image: `ghcr.io/noir017/ant-browser:latest` (public, `linux/amd64`)
+- Image: `ghcr.io/noir017/ant-browser:latest` (public, `linux/amd64` + `linux/arm64`)
 - Built by GitHub Actions from source — the app is never compiled on the target host
 
 ## Quick start
@@ -125,7 +125,7 @@ gh workflow run build.yml -f app_ref=v1.6.0 -f image_tag=1.6.0
 
 ## Notes
 
-- **amd64 only.** Cross-building the Wails/CGO binary for arm64 needs a native runner.
+- **amd64 + arm64.** Each architecture builds on a native runner (`ubuntu-24.04-arm` for arm64); cross-building the Wails/CGO binary is unreliable. The app tarball/.deb of every build is attached to the workflow run as an artifact. Images built before 2026-10-09 are amd64 only.
 - **ipvlan L2.** Verify from a separate LAN host, not from the Docker host itself.
 - **`shm_size: 2gb`.** The base image defaults to 64M and Chromium renderers crash on it.
 - **`seccomp=unconfined`.** Chromium's sandbox needs syscalls the default profile blocks.

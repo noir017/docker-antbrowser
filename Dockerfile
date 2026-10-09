@@ -55,13 +55,15 @@ RUN sed -i '/    document.title =/c\    document.title = "Ant Browser - noVNC";'
  && rm -f /usr/share/novnc/app/images/icons/*
 
 # The app tarball is built by CI (see .github/workflows/build.yml) from
-# noir017/Ant-Browser via the project's own publish/linux/publish-linux.sh.
+# noir017/Ant-Browser via the project's own publish/linux/publish-linux.sh,
+# once per architecture. TARGETARCH (amd64 / arm64) is set by BuildKit.
 #
 # /opt/ant-browser stays root-owned and read-only on purpose: the app detects an
 # unwritable install root and relocates all writable state to
 # $XDG_DATA_HOME/ant-browser, which is the single directory we bind-mount.
 # See backend/internal/apppath/apppath.go in the app repo.
-COPY dist/AntBrowser-linux-amd64.tar.gz /tmp/antbrowser.tar.gz
+ARG TARGETARCH
+COPY dist/AntBrowser-linux-${TARGETARCH}.tar.gz /tmp/antbrowser.tar.gz
 RUN mkdir -p /opt/ant-browser \
  && tar -xzf /tmp/antbrowser.tar.gz -C /opt/ant-browser \
  && rm -f /tmp/antbrowser.tar.gz \

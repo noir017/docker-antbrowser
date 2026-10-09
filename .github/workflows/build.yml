@@ -40,8 +40,21 @@ env:
 
 jobs:
   build:
-    name: Build app and publish image
-    runs-on: ubuntu-24.04
+    name: Build ${{ matrix.arch }}
+    # Each architecture builds on a native runner: cross-building the Wails/CGO
+    # binary is unreliable, and so is running the image checks under QEMU.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      version: ${{ steps.stage.outputs.version }}
+      app_sha: ${{ steps.stage.outputs.app_sha }}
 
     steps:
       - name: Checkout container definition
@@ -99,13 +112,13 @@ jobs:
         working-directory: src
         env:
           BROWSERSLIST_IGNORE_OLD_DATA: "1"
-        run: bash publish/linux/publish-linux.sh --arch amd64
+        run: bash publish/linux/publish-linux.sh --arch ${{ matrix.arch }}
 
       - name: Stage tarball for image build
         id: stage
         run: |
           set -euo pipefail
-          tar_file="$(ls -1 src/publish/output/AntBrowser-*-linux-amd64.tar.gz | head -n 1)"
+          tar_file="$(ls -1 src/publish/output/AntBrowser-*-linux-${{ matrix.arch }}.tar.gz | head -n 1)"
           echo "Staging: $tar_file"
 
           # Fail early rather than shipping an image whose app cannot start.
@@ -117,12 +130,23 @@ jobs:
           test -f "$validate_dir/config.yaml"
 
           mkdir -p dist
-          cp "$tar_file" dist/AntBrowser-linux-amd64.tar.gz
+          cp "$tar_file" dist/AntBrowser-linux-${{ matrix.arch }}.tar.gz
 
-          version="$(basename "$tar_file" | sed -E 's/^AntBrowser-(.+)-linux-amd64\.tar\.gz$/\1/')"
+          version="$(basename "$tar_file" | sed -E 's/^AntBrowser-(.+)-linux-${{ matrix.arch }}\.tar\.gz$/\1/')"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "app_sha=$(git -C src rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "Built version $version"
+
+      # The same tarball that goes into the image (plus the .deb), for running
+      # the app outside Docker.
+      - name: Upload app package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AntBrowser-linux-${{ matrix.arch }}
+          path: |
+            src/publish/output/AntBrowser-*-linux-${{ matrix.arch }}.tar.gz
+            src/publish/output/*_${{ matrix.arch }}.deb
+          if-no-files-found: error
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -134,35 +158,22 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compose image tags
-        id: tags
-        run: |
-          set -euo pipefail
-          repo="${REGISTRY}/${IMAGE_NAME}"
-          repo="$(echo "$repo" | tr '[:upper:]' '[:lower:]')"
-          {
-            echo "tags<<EOF"
-            echo "${repo}:latest"
-            echo "${repo}:${{ steps.stage.outputs.version }}"
-            echo "${repo}:app-${{ steps.stage.outputs.app_sha }}"
-            if [[ -n "${{ inputs.image_tag }}" ]]; then
-              echo "${repo}:${{ inputs.image_tag }}"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+      - name: Resolve image repository
+        id: repo
+        run: echo "name=$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      # Pushed by digest only; the merge job attaches the tags once every
+      # architecture has passed its checks.
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          # Only amd64: the target host is an Intel N100, and cross-building a
-          # Wails/CGO binary for arm64 needs a native runner to be reliable.
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.stage.outputs.version }}
@@ -174,12 +185,14 @@ jobs:
       # A missing shared library only shows up as "the GUI never appears", so
       # assert the link closure now, on the image we just pushed.
       - name: Verify image dependency closure
+        env:
+          IMAGE: ${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          repo="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
-          image="${repo}:${{ steps.stage.outputs.version }}"
-          docker pull "$image"
-          missing="$(docker run --rm --entrypoint bash "$image" -c \
+          docker pull "$IMAGE"
+          arch="$(docker run --rm --entrypoint uname "$IMAGE" -m)"
+          echo "Image reports machine: $arch"
+          missing="$(docker run --rm --entrypoint bash "$IMAGE" -c \
             'ldd /opt/ant-browser/ant-chrome | grep "not found" || true')"
           if [[ -n "$missing" ]]; then
             echo "::error::unresolved shared libraries in image:"
@@ -187,7 +200,7 @@ jobs:
             exit 1
           fi
           echo "All shared libraries resolved."
-          docker run --rm --entrypoint bash "$image" -c \
+          docker run --rm --entrypoint bash "$IMAGE" -c \
             'for b in socat vncserver websockify fluxbox dbus-run-session curl ss xdpyinfo jq; do
                command -v "$b" > /dev/null || { echo "missing: $b"; exit 1; }
              done'
@@ -195,7 +208,7 @@ jobs:
           # Browser cores are supplied at runtime, so CI cannot ldd a real core.
           # Assert the libraries Chromium needs are resolvable instead — a missing
           # NSS stack only shows up as "instances won't start" on the target host.
-          docker run --rm --entrypoint bash "$image" -c '
+          docker run --rm --entrypoint bash "$IMAGE" -c '
             missing=""
             for lib in libnss3.so libnssutil3.so libsmime3.so libnspr4.so \
                        libgbm.so.1 libasound.so.2 libatk-1.0.so.0 libatspi.so.0 \
@@ -206,9 +219,73 @@ jobs:
             if [ -n "$missing" ]; then echo "missing core libs:$missing"; exit 1; fi
             echo "Chromium core libraries resolvable."
           '
-          docker run --rm --entrypoint bash "$image" -c \
+          docker run --rm --entrypoint bash "$IMAGE" -c \
             'bash -n /opt/scripts/start.sh && bash -n /opt/scripts/start-server.sh && bash -n /opt/scripts/antctl'
           echo "Container scripts parse cleanly."
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch tags
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest list and push tags
+        id: tags
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          repo="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          tags=(
+            "${repo}:latest"
+            "${repo}:${{ needs.build.outputs.version }}"
+            "${repo}:app-${{ needs.build.outputs.app_sha }}"
+          )
+          if [[ -n "${{ inputs.image_tag }}" ]]; then
+            tags+=("${repo}:${{ inputs.image_tag }}")
+          fi
+          tag_args=()
+          for tag in "${tags[@]}"; do tag_args+=(-t "$tag"); done
+          sources=()
+          for digest in *; do sources+=("${repo}@sha256:${digest}"); done
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          docker buildx imagetools inspect "${tags[0]}"
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Summary
         run: |
@@ -217,12 +294,15 @@ jobs:
             echo ""
             echo "| field | value |"
             echo "|---|---|"
-            echo "| app version | \`${{ steps.stage.outputs.version }}\` |"
+            echo "| app version | \`${{ needs.build.outputs.version }}\` |"
             echo "| app repo | \`${{ env.APP_REPO }}\` |"
             echo "| app ref | \`${{ env.APP_REF }}\` |"
-            echo "| app commit | \`${{ steps.stage.outputs.app_sha }}\` |"
+            echo "| app commit | \`${{ needs.build.outputs.app_sha }}\` |"
+            echo "| platforms | \`linux/amd64\`, \`linux/arm64\` |"
             echo ""
             echo '```'
             echo "${{ steps.tags.outputs.tags }}"
             echo '```'
+            echo ""
+            echo "App packages are attached to this run as \`AntBrowser-linux-amd64\` / \`AntBrowser-linux-arm64\`."
           } >> "$GITHUB_STEP_SUMMARY"
