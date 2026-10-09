@@ -1,6 +1,6 @@
 #!/bin/bash
 # Display stack + app bring-up, runs as ${USER}.
-# TurboVNC on :99 -> fluxbox -> websockify/noVNC -> Ant Browser -> Launch API relay.
+# TurboVNC (TigerVNC on arm64) on :99 -> fluxbox -> websockify/noVNC -> Ant Browser -> Launch API relay.
 
 export DISPLAY=:99
 export XAUTHORITY=${DATA_DIR}/.Xauthority
@@ -44,9 +44,20 @@ screen -wipe 2&>/dev/null
 echo "---Clearing stale app locks---"
 /opt/scripts/antctl unlock --quiet ||:
 
-echo "---Starting TurboVNC server---"
-vncserver -geometry "${CUSTOM_RES_W}x${CUSTOM_RES_H}" -depth "${CUSTOM_DEPTH}" :99 \
-	-rfbport "${RFB_PORT}" -noxstartup -noserverkeymap ${TURBOVNC_PARAMS} 2>/dev/null
+# Xtigervnc only exists where the Dockerfile installed TigerVNC (arm64). Test for
+# it rather than for vncserver: TigerVNC ships a vncserver wrapper too, and that
+# one rejects TurboVNC's flags.
+if command -v Xtigervnc > /dev/null 2>&1; then
+	# Xtigervnc is the X server itself; run it directly, the wrapper adds nothing here.
+	echo "---Starting TigerVNC server---"
+	Xtigervnc :99 -geometry "${CUSTOM_RES_W}x${CUSTOM_RES_H}" -depth "${CUSTOM_DEPTH}" \
+		-rfbport "${RFB_PORT}" -AlwaysShared -desktop "Ant Browser" ${TURBOVNC_PARAMS} \
+		> /tmp/Xtigervnc.log 2>&1 &
+else
+	echo "---Starting TurboVNC server---"
+	vncserver -geometry "${CUSTOM_RES_W}x${CUSTOM_RES_H}" -depth "${CUSTOM_DEPTH}" :99 \
+		-rfbport "${RFB_PORT}" -noxstartup -noserverkeymap ${TURBOVNC_PARAMS} 2>/dev/null
+fi
 sleep 2
 
 echo "---Starting Fluxbox---"
