@@ -58,11 +58,27 @@ reexec_as_user_if_root() {
     fi
 }
 
+# The pidfile lives in /tmp, which survives `docker restart`; after a restart
+# its PID can belong to an unrelated process (seen: websockify), so a live PID
+# alone proves nothing. Accept it only if that process is running the app.
+pid_is_app() {
+    local cmdline
+    { cmdline="$(tr '\0' ' ' < "/proc/$1/cmdline")"; } 2>/dev/null || return 1
+    [[ "$cmdline" == *"$APP_BIN"* ]]
+}
+
+# api_code prints the HTTP status of a Launch API path, 000 when nothing answers.
+# 401 still means the API is up: it just has launch_server.auth enabled.
+api_code() {
+    curl -sS -o /dev/null -w '%{http_code}' --max-time "${2:-2}" \
+        "http://127.0.0.1:${ANT_API_PORT}${1}" 2>/dev/null || true
+}
+
 app_pid() {
     if [[ -f "$PID_FILE" ]]; then
         local pid
         pid="$(cat "$PID_FILE" 2>/dev/null)"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && pid_is_app "$pid"; then
             echo "$pid"
             return 0
         fi
@@ -144,7 +160,7 @@ start_app() {
     # The Launch API comes up a moment after the window.
     local waited=0
     while [[ $waited -lt 20 ]]; do
-        if curl -fsS --max-time 2 "http://127.0.0.1:${ANT_API_PORT}/api/health" > /dev/null 2>&1; then
+        if [[ "$(api_code /api/health)" =~ ^(200|401)$ ]]; then
             echo "✅ Launch API 就绪: http://127.0.0.1:${ANT_API_PORT}"
             return 0
         fi
@@ -242,6 +258,8 @@ show_status() {
     health="$(curl -fsS --max-time 3 "http://127.0.0.1:${ANT_API_PORT}/api/health" 2>/dev/null)"
     if [[ -n "$health" ]]; then
         printf "  %-14s %s\n" "健康检查" "$health"
+    elif [[ "$(api_code /api/health 3)" == "401" ]]; then
+        printf "  %-14s %s\n" "健康检查" "在线（已启用 API Key 鉴权）"
     else
         printf "  %-14s %s\n" "健康检查" "无响应"
     fi
